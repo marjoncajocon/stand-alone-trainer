@@ -240,26 +240,41 @@ The draughts chain, in order of what it catches:
 - **Only `filipino` has a live corpus.** The other five descriptors are correct
   by construction and by the parity gate, but untested against real data.
 
-## A bug this replaces: chess-cli's trainer.c drops ~19% of every corpus
+## A parser bug found here, and fixed in chess-cli
 
-`chess-cli/c_port/tools/trainer.c:106` finds the result token by substring
-search, with the comment *"FENs never contain these substrings"*. That is
-false. A FEN's placement field contains **`1/2`** whenever a rank ends with one
-empty square and the next begins with two — `rnbqkbn1/2pppppp/...`. `strstr`
-then matches inside the FEN, line 126 truncates the string there, `pos_from_fen`
-fails, and the line is **silently discarded**.
+Cross-checking this loader against `chess-cli/c_port/tools/trainer.c` turned up
+a real bug in the latter. It found the result token by substring search over the
+whole line, guarded by the comment *"FENs never contain these substrings"*.
+That is false: a FEN's **placement** field contains `1/2` whenever a rank ends
+with exactly one empty square and the next begins with exactly two —
+`rnbqkbn1/2pppppp/...`. It broke both input formats, differently:
 
-Measured on 8 corpus files: 2,245,788 lines total. This trainer reads all of
-them; `trainer.c` reads 1,825,852 and drops **419,936 — exactly the number of
-lines whose placement field contains `1/2`**, matching to the line.
+| corpus | effect | measured |
+|---|---|---|
+| self-play `.txt` | FEN truncated at the false match → `pos_from_fen` fails → line **silently dropped** | 419,936 of 2,245,788 (**18.7%**) |
+| `quiet-labeled.epd` | `" c9"` kept the FEN intact, but the result was already read as 0.5 → decisive games **relabelled draws** | 82,812 of 725,000 (**11.4%**) |
 
-It is not a random 19% either. It selects for a specific emptiness pattern, so
-the discarded set is structurally biased rather than a uniform sample. Every
-chess NNUE net trained with that kit was fitted on the surviving 81%.
+Neither is a uniform sample — both select for one emptiness pattern, so the
+damage is structurally biased. The EPD case is the worse of the two: it is the
+725k warm-start set every chess net was initialised from, and the corruption is
+silent. It also mis-parsed `gameid` on those lines, which scrambled the
+holdout grouping.
 
-This loader parses by FIELD POSITION (`fenSpan`), so it cannot go wrong the same
-way — and it is why the "line" counters here will not match a historical
-`trainer.c` log on the same data.
+**Fixed** in `c_port/tools/trainer.c` — the result is now matched as a whole
+token, and the EPD form is handled by its own branch. Verified three ways, old
+binary vs new on identical data:
+
+- self-play: `1,825,852 → 2,245,788` lines, `1,529,090 → 1,907,570` unique —
+  now **identical to this trainer's counters**, including the 1,898,403
+  eval-labelled count. Two independent implementations agreeing exactly.
+- EPD: unchanged line/unique counts (those were never dropped), but epoch-1
+  valid MSE moves `0.068426 → 0.088885`. Higher is CORRECT here: 82,812 labels
+  stopped being flattened to 0.5, which was an artificially easy target.
+- EPD holdout: `50,207 → 36,253` validation positions, against 724,127/20 =
+  36,206 expected. The old figure was inflated by the bogus gameids.
+
+This loader parses by FIELD POSITION (`fenSpan`), so it never had the bug — and
+that is why counters here will not match a *historical* `trainer.c` log.
 
 ## MSE numbers are corpus-relative
 
