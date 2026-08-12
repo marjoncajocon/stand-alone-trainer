@@ -183,6 +183,53 @@ def find_packer(explicit):
         "  or pack at home and pass --corpus instead.")
 
 
+_runnable_cache = {}
+
+
+def runnable(path):
+    """Return a path to `path` that can actually be exec'd.
+
+    Google Drive is mounted noexec, so execution is refused at the mount level
+    no matter what the permission bits say - and os.access(X_OK) still returns
+    True there, which makes "check, then copy if needed" useless. So on POSIX we
+    copy to local disk unconditionally. 2 MB, once.
+    """
+    if os.name == "nt":
+        return path
+    if path in _runnable_cache:
+        return _runnable_cache[path]
+    import shutil, tempfile
+    local = os.path.join(tempfile.mkdtemp(prefix="ntbin_"), os.path.basename(path))
+    shutil.copy2(path, local)
+    os.chmod(local, 0o755)
+    print(f"  (copied to {local}: Drive is mounted noexec)")
+    _runnable_cache[path] = local
+    return local
+
+
+def emit_header(args, variant, ntw, outh):
+    """Generate nnue_weights.h by calling the Go emitter.
+
+    The header writer is NOT reimplemented here. Its exact byte layout is a
+    compatibility contract with six engines and it is covered by the 350-board
+    parity gate; a second implementation would be an unvalidated copy.
+    """
+    import subprocess
+    try:
+        binpath = runnable(find_packer(args.packer))
+    except SystemExit as e:
+        print(f"\nnote: {e}")
+        print(f"  Skipping --outh. Generate it at home instead:")
+        print(f"    trainer --variant={variant} --load {os.path.basename(ntw)} "
+              f"--convert --outh nnue_weights.h")
+        return
+    r = subprocess.run([binpath, f"--variant={variant}", "--load", ntw,
+                        "--convert", "--outh", outh])
+    if r.returncode != 0:
+        raise SystemExit(f"error: header generation failed (exit {r.returncode})")
+    print(f"wrote {outh}")
+
+
 def resolve_corpus(args):
     import subprocess
     if args.corpus and args.data:
@@ -202,19 +249,7 @@ def resolve_corpus(args):
         return out
     print(f"packing {args.data} -> {out}\n  using {packer}")
 
-    # Copy the packer to local disk before running it, ALWAYS, on POSIX.
-    #
-    # Google Drive is mounted noexec, so execution is refused at the mount level
-    # no matter what the permission bits say - and os.access(X_OK) still returns
-    # True there, which makes "check then run" useless. Copying 2 MB is cheaper
-    # than trying to detect the condition.
-    import shutil, tempfile
-    if os.name != "nt":
-        local = os.path.join(tempfile.mkdtemp(prefix="ntpack_"), os.path.basename(packer))
-        shutil.copy2(packer, local)
-        os.chmod(local, 0o755)
-        print(f"  (copied to {local}: Drive is mounted noexec)")
-        packer = local
+    packer = runnable(packer)
 
     try:
         # --h is irrelevant to packing, but older builds of the Go binary
@@ -252,6 +287,9 @@ def main():
     ap.add_argument("--keep-corpus", default="",
                     help="with --data: where to save the .ntc so later runs skip packing")
     ap.add_argument("--out", default="", help="output .ntw (default nn_<variant>_h<H>.ntw)")
+    ap.add_argument("--outh", default="",
+                    help="also emit nnue_weights.h here, by calling the Go emitter "
+                         "(the header writer is not reimplemented in Python)")
     ap.add_argument("--h", type=int, default=256, help="hidden units")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=8192)
@@ -406,10 +444,24 @@ def main():
         sys.exit(4)
 
     print(f"wrote {out}  ({time.time() - t_start:.0f}s total)")
+
+    if args.outh:
+        emit_header(args, c["variant"], out, args.outh)
+
     print()
-    print("Next, on the machine that ships it:")
-    print(f"  trainer --variant={c['variant']} --load {out} --convert --outh nnue_weights.h")
-    print(f"  parity.ps1 -Bin {out} -Variant {c['variant']}      # MUST print PARITY: PASS")
+    print("DOWNLOAD THESE:")
+    print(f"  {out}" + ("" if not args.outh else f"\n  {args.outh}")
+          + ("" if not args.log else f"\n  {args.log}"))
+    print()
+    print("Then, ON THE MACHINE THAT SHIPS IT - the header is never installed from")
+    print("a run that was not re-checked locally:")
+    if not args.outh:
+        print(f"  trainer --variant={c['variant']} --load {os.path.basename(out)} "
+              f"--convert --outh nnue_weights.h")
+    print(f"  parity.ps1 -Bin {os.path.basename(out)} -Variant {c['variant']}   "
+          f"# MUST print PARITY: PASS")
+    print(f"  copy nnue_weights.h into that engine's c_port\\, then probe_accbound, "
+          f"then depth-10 games")
 
 
 if __name__ == "__main__":
