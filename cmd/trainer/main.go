@@ -111,6 +111,14 @@ func main() {
 	if err != nil {
 		die(2, "%v", err)
 	}
+	// K is a property of the ENGINE's eval scale, not a taste knob: chess's
+	// trainer uses sigmoid(score/400) (tools/trainer.c:49) while the draughts
+	// reference uses /256. Defaulting per variant keeps a chess run comparable
+	// with chess-cli's own numbers without the user having to know this.
+	// An explicit --k still wins.
+	if !flagPassed("k") && v.IsChess() {
+		*kScale = 1.0 / 400.0
+	}
 	if *buckets == 0 {
 		*buckets = v.Buckets
 	}
@@ -238,17 +246,23 @@ func main() {
 	// packed data/<variant>.ntc wins if present, since it is both faster and
 	// split-frozen.
 	if *corpusPath == "" && len(data) == 0 {
-		if pk, glob, where := discoverData(v); pk != "" {
+		if pk, globs, where := discoverData(v); pk != "" {
 			*corpusPath = pk
 			fmt.Printf("using packed corpus %s\n", pk)
-		} else if glob != "" {
-			data = append(data, glob)
-			fmt.Printf("using %s\n", glob)
+		} else if len(globs) > 0 {
+			data = append(data, globs...)
+			for _, g := range globs {
+				fmt.Printf("using %s\n", g)
+			}
 		} else {
+			want := ""
+			for _, f := range dataFolders(v) {
+				want += fmt.Sprintf("  Expected  data\\%s\\*.txt\n", f)
+			}
 			die(2, "no data found.\n"+
 				"  Put selfplay files in one of these, or pass --data / --corpus:\n%s"+
-				"  Expected  data\\%s\\*.txt  or a packed  data\\%s.ntc\n"+
-				"  (--list-variants shows every variant)", where, v.Name, v.Name)
+				"%s  or a packed  data\\%s.ntc\n"+
+				"  (--list-variants shows every variant)", where, want, v.Name)
 		}
 	}
 
@@ -277,7 +291,12 @@ func main() {
 		return
 	}
 
-	fmt.Printf("valid MSE, anchor-only (material): %.6f\n", model.AnchorMSE(set.Valid, *kScale))
+	anchorKind := "material"
+	if v.IsChess() {
+		anchorKind = "eval_classical"
+	}
+	fmt.Printf("valid MSE, anchor-only (%s): %.6f\n", anchorKind,
+		model.AnchorMSE(set.Valid, *kScale))
 
 	if *load != "" && *evalOnly {
 		q, err := emit.LoadBin(*load, v)
@@ -310,11 +329,20 @@ func main() {
 	// so requiring H before those would fail a pack on any machine that has no
 	// engine repo to read NN_H from (e.g. Colab).
 	if *h == 0 {
-		*h = shippedH(workspace, v)
+		// A pinned width needs no header to discover it, which also means a
+		// chess pack works on a machine with no chess-cli checkout at all.
+		if v.FixedH != 0 {
+			*h = v.FixedH
+		} else {
+			*h = shippedH(workspace, v)
+		}
 	}
 	if *h <= 0 {
 		die(2, "could not determine H (no %s/nnue_weights.h found to read NN_H from).\n"+
 			"  Pass --h explicitly, e.g. --h 256.", v.EngineDir)
+	}
+	if err := v.CheckH(*h); err != nil {
+		die(2, "%v", err)
 	}
 	if *h%8 != 0 {
 		warn("H=%d is not a multiple of 8; the shipped kernel's inner loop vectorizes poorly.", *h)
@@ -326,6 +354,17 @@ func main() {
 	}
 
 	rng := rand.New(rand.NewSource(*seed))
+	// Checked HERE, not at flag time: --pack, --convert, --probe* and
+	// --eval-only all leave --algo at its default and never train, so rejecting
+	// earlier would refuse a perfectly valid chess pack.
+	if !minib && v.IsChess() {
+		die(2, "--algo=online is draughts-only.\n"+
+			"  That path exists to reproduce a historical Go reference trainer\n"+
+			"  bit-for-bit; chess has no counterpart (chess-cli's trainer.c is C,\n"+
+			"  minibatch and Adam), so an \"online\" chess run would reproduce\n"+
+			"  nothing while looking like a second opinion. Use --algo=minibatch.")
+	}
+
 	m := model.New(v, *h, *buckets, rng)
 
 	fmt.Printf("variant=%s  H=%d  feats=%d  buckets=%d  algo=%s  opt=%s  epochs=%d  lr=%g  seed=%d\n",
@@ -354,14 +393,25 @@ func main() {
 	fmt.Printf("valid MSE, QUANTIZED net: %.6f\n", q.MSE(set.Pool, set.Valid, *kScale))
 
 	lo, hi := q.AccBound(set.Pool, set.Valid)
-	head := int32(32767)
-	fmt.Printf("accumulator bound over the holdout: HI %+d  LO %+d  (int16 limit +/-32767)\n", hi, lo)
-	if hi > head || lo < -head {
-		die(4, "ACCUMULATOR OVERFLOW: this net would silently miscompute in the engine's\n"+
-			"  int16 kernel. Do not install it. Retrain with a smaller --lr or add clipping.")
+	if v.IsChess() {
+		// Reported, but NOT a gate. chess-cli keeps its accumulator in int32
+		// deliberately -- position.h:34-42 says outright that pre-activation
+		// sums can exceed the int16 range with this net's weight magnitudes.
+		// Applying the draughts overflow check here would fail perfectly good
+		// nets; claiming "int16 SAFE" would be a gate that proves nothing.
+		fmt.Printf("accumulator bound over the holdout: HI %+d  LO %+d\n", hi, lo)
+		fmt.Println("  chess accumulates in int32 by design (position.h:34-42), so there is no")
+		fmt.Println("  int16 overflow gate here — this is information, not a pass.")
+	} else {
+		head := int32(32767)
+		fmt.Printf("accumulator bound over the holdout: HI %+d  LO %+d  (int16 limit +/-32767)\n", hi, lo)
+		if hi > head || lo < -head {
+			die(4, "ACCUMULATOR OVERFLOW: this net would silently miscompute in the engine's\n"+
+				"  int16 kernel. Do not install it. Retrain with a smaller --lr or add clipping.")
+		}
+		fmt.Printf("  headroom: %d above HI, %d below LO — int16 accumulator is SAFE.\n", head-hi, head+lo)
+		fmt.Println("  (still run c_port/tools/probes/probe_accbound.exe: it scans a different set)")
 	}
-	fmt.Printf("  headroom: %d above HI, %d below LO — int16 accumulator is SAFE.\n", head-hi, head+lo)
-	fmt.Println("  (still run c_port/tools/probes/probe_accbound.exe: it scans a different set)")
 
 	if *out == "" {
 		*out = fmt.Sprintf("nn_%s_h%d.ntw", v.Name, *h)
@@ -371,6 +421,17 @@ func main() {
 	}
 	if err := emit.Header(*outH, q, v); err != nil {
 		die(2, "write header: %v", err)
+	}
+	// Chess also gets a net.bin: it is chess-cli's own float format, so the
+	// weights stay usable by that kit's n2h.exe and by its trainer's -init warm
+	// start. It is also what lets a second tool re-derive the header, which is
+	// how the quantization contract is cross-checked.
+	if v.IsChess() {
+		nb := strings.TrimSuffix(*out, filepath.Ext(*out)) + ".bin"
+		if err := emit.NetBin(nb, m); err != nil {
+			die(2, "write net.bin: %v", err)
+		}
+		fmt.Printf("wrote %s (chess-cli net.bin, version 2 = residue on eval_classical)\n", nb)
 	}
 	fmt.Printf("wrote %s + %s (variant=%s H=%d buckets=%d) in %s\n",
 		*out, *outH, v.Name, *h, *buckets, time.Since(t0).Round(time.Second))
@@ -457,15 +518,39 @@ func packForGPU(set *corpus.Set) *gpu.Corpus {
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 func printVariants() {
-	fmt.Printf("%-14s %-30s %5s %6s %7s %8s %8s  %s\n",
-		"VARIANT", "ENGINE", "CELLS", "FEATS", "BUCKETS", "MAN", "KING", "TB-SKIP")
+	fmt.Printf("%-14s %-30s %-9s %5s %6s %7s %6s  %s\n",
+		"VARIANT", "ENGINE", "KERNEL", "CELLS", "FEATS", "BUCKETS", "H", "ANCHOR")
 	for _, n := range variant.Names() {
 		v, _ := variant.Get(n)
-		fmt.Printf("%-14s %-30s %5d %6d %7d %8d %8d  %s\n",
-			v.Name, v.EngineDir, v.Cells, v.NumFeat, v.Buckets, v.ValMan, v.ValKing, v.SkipDoc)
+		// The draughts columns are meaningless under the chess kernel; printing
+		// a literal 0 for CELLS or a material value would read as a bug rather
+		// than as "not applicable".
+		cells, hCol, anchor := fmt.Sprint(v.Cells), "shipped", "-"
+		if v.IsChess() {
+			cells = "-"
+		} else {
+			anchor = fmt.Sprintf("man %d / king %d", v.ValMan, v.ValKing)
+		}
+		if v.FixedH != 0 {
+			hCol = fmt.Sprintf("%d pin", v.FixedH)
+		}
+		if v.IsChess() {
+			anchor = "eval_classical (HCE)"
+		}
+		fmt.Printf("%-14s %-30s %-9s %5s %6d %7d %6s  %s\n",
+			v.Name, v.EngineDir, v.Kernel, cells, v.NumFeat, v.Buckets, hCol, anchor)
 	}
 	fmt.Println("\nBUCKETS is what that engine's search.c implements today, not a preference.")
 	fmt.Println("english/russian/international have no NN_W2_BUCKETS branch at all.")
+	fmt.Println("\nTB-SKIP, by variant:")
+	for _, n := range variant.Names() {
+		v, _ := variant.Get(n)
+		fmt.Printf("  %-14s %s\n", v.Name, v.SkipDoc)
+	}
+	fmt.Println("\nchess is the other KERNEL family: FEN input, stm-relative features, one")
+	fmt.Println("accumulator (no mirror pair), an output bias, QA=255, and a full hand-crafted")
+	fmt.Println("eval as its anchor. H is pinned because its nnue.c static-asserts NNUE_HID.")
+	fmt.Println("--variant=chess reads BOTH data\\chess and data\\chess960 into one net.")
 }
 
 var reNNH = regexp.MustCompile(`(?m)^#define\s+NN_H\s+(\d+)`)
@@ -514,23 +599,58 @@ func dataRoots() []string {
 	return out
 }
 
+// flagPassed reports whether the user actually gave this flag, so a per-variant
+// default can be applied without overriding an explicit value.
+func flagPassed(name string) bool {
+	found := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// dataFolders lists the data/<folder> directories a variant reads.
+//
+// Chess reads TWO: standard and Chess960 pool into one net, because the eval is
+// position-agnostic and the app ships a single net -- the same choice
+// chess-cli's own kit makes (tools/trainer/README.txt:91-94). The folders stay
+// separate on disk so the generator can keep them from mixing by accident
+// (stand-alone-selfplay's SP_TOKEN_FOR), and the loader's holdout group key
+// uses the folder name so a standard file and a 960 file with the same
+// basename never share a group.
+func dataFolders(v *variant.Variant) []string {
+	if v.IsChess() {
+		return []string{"chess", "chess960"}
+	}
+	return []string{v.Name}
+}
+
 // discoverData finds a corpus for v without any flags. Returns (packedPath,
-// textGlob, searchedDescription); at most one of the first two is non-empty.
-func discoverData(v *variant.Variant) (string, string, string) {
+// textGlobs, searchedDescription); at most one of the first two is non-empty.
+func discoverData(v *variant.Variant) (string, []string, string) {
 	var searched strings.Builder
+	folders := dataFolders(v)
 	for _, root := range dataRoots() {
 		fmt.Fprintf(&searched, "    %s\n", root)
 		// A packed corpus wins: faster to load and its split is frozen.
 		pk := filepath.Join(root, v.Name+".ntc")
 		if _, err := os.Stat(pk); err == nil {
-			return pk, "", ""
+			return pk, nil, ""
 		}
-		glob := filepath.Join(root, v.Name, "*.txt")
-		if m, err := filepath.Glob(glob); err == nil && len(m) > 0 {
-			return "", glob, ""
+		var globs []string
+		for _, f := range folders {
+			glob := filepath.Join(root, f, "*.txt")
+			if m, err := filepath.Glob(glob); err == nil && len(m) > 0 {
+				globs = append(globs, glob)
+			}
+		}
+		if len(globs) > 0 {
+			return "", globs, ""
 		}
 	}
-	return "", "", searched.String()
+	return "", nil, searched.String()
 }
 
 // resolveRepo finds the workspace root that holds the engine repos.

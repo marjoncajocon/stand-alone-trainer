@@ -9,6 +9,27 @@ import (
 	"nnuetrainer/internal/variant"
 )
 
+// draughtsNames is variant.Names() minus the chess kernel.
+//
+// Every test below asserts a property of the DRAUGHTS kernel specifically --
+// the mirror permutation, f(b) = g(b) - g(mirror(b)) antisymmetry, the int16
+// narrow accumulator, the NTW1 layout, phase buckets. Chess has none of them:
+// its symmetry lives in the input encoding, it has one accumulator, its C
+// kernel accumulates in int32 by design (position.h:34-42), and it uses NTW2.
+// Filtering here rather than skipping inside each test keeps the reason in one
+// place. Chess's equivalents live in internal/chess and in TestChessKernel.
+func draughtsNames() []string {
+	var out []string
+	for _, n := range variant.Names() {
+		v, err := variant.Get(n)
+		if err != nil || v.IsChess() {
+			continue
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 // mirrorBoard applies the 180-degree rotation plus colour swap that the network
 // architecture is built around. On every variant here the board string is
 // row-major over Board*Board cells, so rotating 180 degrees is exactly
@@ -71,7 +92,7 @@ func randQuant(v *variant.Variant, h int, rng *rand.Rand) *model.Quant {
 // TestMirrorIsInvolution: the mirror permutation must be its own inverse, or
 // f(b) = g(b) - g(mirror(b)) is not antisymmetric.
 func TestMirrorIsInvolution(t *testing.T) {
-	for _, name := range variant.Names() {
+	for _, name := range draughtsNames() {
 		v, err := variant.Get(name)
 		if err != nil {
 			t.Fatal(err)
@@ -100,7 +121,7 @@ func TestMirrorIsInvolution(t *testing.T) {
 // search overvalued grabbing material as a result.
 func TestAntisymmetry(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
-	for _, name := range variant.Names() {
+	for _, name := range draughtsNames() {
 		v, _ := variant.Get(name)
 		for _, h := range []int{32, 64} {
 			q := randQuant(v, h, rng)
@@ -138,7 +159,7 @@ func TestAntisymmetry(t *testing.T) {
 // against the int32 reference, on nets small enough that no overflow is possible.
 func TestNarrowKernelAgrees(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
-	for _, name := range variant.Names() {
+	for _, name := range draughtsNames() {
 		v, _ := variant.Get(name)
 		q := randQuant(v, 64, rng)
 		for trial := 0; trial < 200; trial++ {
@@ -156,7 +177,7 @@ func TestNarrowKernelAgrees(t *testing.T) {
 // #define block must reflect the architecture.
 func TestBinRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(3))
-	for _, name := range variant.Names() {
+	for _, name := range draughtsNames() {
 		v, _ := variant.Get(name)
 		q := randQuant(v, 32, rng)
 		p := t.TempDir() + "/nn.ntw"

@@ -38,8 +38,24 @@ type OnlineOpts struct {
 	Report func(epoch int, mse float64, elapsed time.Duration)
 }
 
+// SupportsOnline reports whether this model can use the batch-1 oracle.
+//
+// It cannot for chess, and that is not an omission to fill in later. The whole
+// value of this path is that it reproduces a HISTORICAL reference trainer
+// bit-for-bit; chess has no such reference in this shape (chess-cli's trainer.c
+// is C, minibatch, and Adam), so a chess "online" run would reproduce nothing
+// and its only effect would be to look like a second opinion it is not.
+func SupportsOnline(m *model.Model) bool { return !m.IsChess() }
+
 // Online runs batch-1 AdaGrad for Opts.Epochs over set.Train.
+//
+// Draughts only; see SupportsOnline. Callers must check first -- this panics
+// rather than silently training the wrong kernel, because a chess model has a
+// nil Mirror and the loop below would produce plausible-looking garbage.
 func Online(m *model.Model, set *corpus.Set, o OnlineOpts) {
+	if !SupportsOnline(m) {
+		panic("train.Online: chess has no batch-1 reference trainer; use --algo=minibatch")
+	}
 	h := m.H
 	pool := set.Pool
 	train := set.Train

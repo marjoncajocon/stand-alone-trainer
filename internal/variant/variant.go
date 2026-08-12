@@ -10,12 +10,62 @@
 // looks surprising (english kings are worth 150, brazilian skips nothing but
 // empty boards) it is surprising in the source too, and a comment says so.
 //
-// The one thing a descriptor may NOT change is the network topology. Every
-// engine's bb_nnue_score16 implements exactly one hidden layer with a
-// per-bucket output row, so the trainer produces exactly that and nothing else.
+// A descriptor may not change the network topology WITHIN ITS KERNEL FAMILY.
+// Every draughts engine's bb_nnue_score16 implements exactly one hidden layer
+// with a per-bucket output row, so the trainer produces exactly that for them
+// and nothing else.
+//
+// There are two kernel families, because chess is not a seventh draughts
+// variant. Its engine (chess-cli/c_port/nnue.c) implements a genuinely
+// different kernel: stm-relative input features instead of absolute ones, one
+// accumulator instead of the g(b) - g(mirror(b)) pair, an output bias, and
+// QA=255 instead of 256. See Kernel below. Nothing in this file is shared
+// between the families except the registry itself.
 package variant
 
 import "fmt"
+
+// Kernel selects which integer evaluation kernel the target engine implements.
+// It decides the feature encoding, the forward pass, the quantization scale
+// and the generated header's shape -- everything the two families disagree on.
+type Kernel int
+
+const (
+	// KernelDraughts is the six checkers engines' bb_nnue_score16:
+	//
+	//	g(b)    = 64 * W2[bucket] . crelu01(B1 + sum_f W1[f])
+	//	f(b)    = g(b) - g(mirror(b))
+	//	score_X = anchor + f(b)
+	//
+	// Features are ABSOLUTE (4 planes x playable squares) and antisymmetry is
+	// recovered at the output by evaluating one shared W1 twice. Quantization
+	// is x256 with the activation clamped to [0,256]. The zero value, so the
+	// six existing descriptors need no field.
+	KernelDraughts Kernel = iota
+
+	// KernelChess768 is chess-cli/c_port/nnue.c:
+	//
+	//	acc     = B1 + sum_f W1[f]           (f is stm-relative)
+	//	out     = B2 + sum_j W2[j]*clamp(acc[j], 0, 255)
+	//	score   = round(out / (255*64))      centipawns, stm-relative
+	//	engine  = eval_classical + score     (the anchor is a full HCE)
+	//
+	// Features are STM-RELATIVE (rel_color x piece type x square), so the
+	// symmetry lives in the INPUT and there is no mirror permutation and no
+	// second accumulator. There is an output bias, which the draughts kernel
+	// does not have.
+	KernelChess768
+)
+
+func (k Kernel) String() string {
+	switch k {
+	case KernelDraughts:
+		return "draughts"
+	case KernelChess768:
+		return "chess768"
+	}
+	return fmt.Sprintf("Kernel(%d)", int(k))
+}
 
 // SkipFunc reports whether a position is tablebase territory and must be
 // dropped: the engine answers those from its TB probe before eval ever runs,
@@ -23,16 +73,33 @@ import "fmt"
 type SkipFunc func(xMen, oMen, xKings, oKings int) bool
 
 // Variant is a complete description of one engine's NNUE input contract.
+//
+// Fields marked "draughts only" are meaningless under KernelChess768: chess has
+// no fixed-length board string, no playable-square numbering, no man/king
+// material split and no tablebase skip. They are left zero there, and the code
+// paths that read them are behind a kernel branch.
 type Variant struct {
 	Name      string // --variant value, and the data-file infix
 	EngineDir string // where nnue_weights.h gets installed, relative to the workspace
 
-	Board   int // 8 or 10
-	Cells   int // Board*Board — the board string length in the data
-	Squares int // playable squares: 32 diagonal, 50 diagonal (10x10), 64 all
-	NumFeat int // 4 * Squares
+	// Kernel selects the evaluation kernel family. Zero value is
+	// KernelDraughts, which is why the six draughts descriptors omit it.
+	Kernel Kernel
 
-	ValMan  int // frozen material anchor, engine units
+	Board   int // draughts only: 8 or 10
+	Cells   int // draughts only: Board*Board — the board string length in the data
+	Squares int // draughts only: playable squares — 32 diagonal, 50 (10x10), 64 all
+	NumFeat int // draughts: 4*Squares. chess: 768.
+
+	// FixedH pins the hidden width when the engine cannot accept any other.
+	// 0 means --h is free. Chess pins 256: nnue.c:14 is a _Static_assert on
+	// NNUE_HID == 256 because Position.nnue_acc is declared [2][256].
+	FixedH int
+
+	// Frozen material anchor, engine units. Draughts only: chess's anchor is
+	// eval_classical(), a full texel-tuned HCE computed per position by
+	// internal/chess, not a piece count.
+	ValMan  int
 	ValKing int
 
 	// Buckets is what that repo's search.c implements TODAY. english, russian
@@ -70,17 +137,17 @@ func Get(name string) (*Variant, error) {
 
 // Names returns every registered variant, in a stable order.
 func Names() []string {
-	return []string{"filipino", "brazilian", "english", "russian", "international", "turkish"}
+	return []string{"filipino", "brazilian", "english", "russian", "international",
+		"turkish", "chess"}
 }
+
+// IsChess reports whether this descriptor uses the chess kernel. Call sites
+// read better as v.IsChess() than as a Kernel comparison, and it keeps the
+// enum from leaking into every package.
+func (v *Variant) IsChess() bool { return v.Kernel == KernelChess768 }
 
 // Validate catches a descriptor that contradicts itself before any data is read.
 func (v *Variant) Validate() error {
-	if v.Cells != v.Board*v.Board {
-		return fmt.Errorf("Cells %d != Board^2 %d", v.Cells, v.Board*v.Board)
-	}
-	if v.NumFeat != 4*v.Squares {
-		return fmt.Errorf("NumFeat %d != 4*Squares %d", v.NumFeat, 4*v.Squares)
-	}
 	if v.NumFeat > 65535 {
 		return fmt.Errorf("NumFeat %d exceeds the uint16 feature index", v.NumFeat)
 	}
@@ -96,13 +163,54 @@ func (v *Variant) Validate() error {
 			return fmt.Errorf("PhaseCuts must be strictly descending, got %v", v.PhaseCuts)
 		}
 	}
+
+	if v.IsChess() {
+		// The chess kernel's geometry is not a parameter — it is compiled into
+		// the engine (nnue.h:32-35), so anything but these values would emit a
+		// header chess-cli cannot use.
+		if v.NumFeat != 768 {
+			return fmt.Errorf("chess NumFeat %d != 768 (nnue.h:32)", v.NumFeat)
+		}
+		if v.Buckets != 1 {
+			return fmt.Errorf("chess Buckets %d != 1 (its kernel has no bucket branch)", v.Buckets)
+		}
+		if v.FixedH != 256 {
+			return fmt.Errorf("chess FixedH %d != 256 (nnue.c:14 static-asserts NNUE_HID == 256)", v.FixedH)
+		}
+		return nil
+	}
+
+	if v.Cells != v.Board*v.Board {
+		return fmt.Errorf("Cells %d != Board^2 %d", v.Cells, v.Board*v.Board)
+	}
+	if v.NumFeat != 4*v.Squares {
+		return fmt.Errorf("NumFeat %d != 4*Squares %d", v.NumFeat, 4*v.Squares)
+	}
 	if v.TBSkip == nil {
 		return fmt.Errorf("TBSkip is nil (use NoSkip for variants that skip nothing)")
 	}
 	return nil
 }
 
+// CheckH validates a requested hidden width against the engine's constraint.
+func (v *Variant) CheckH(h int) error {
+	if h < 1 {
+		return fmt.Errorf("--h %d must be >= 1", h)
+	}
+	if v.FixedH != 0 && h != v.FixedH {
+		return fmt.Errorf("--h %d is not usable for %s: its engine pins the accumulator "+
+			"width at %d (nnue.c:14 static-asserts NNUE_HID == %d because "+
+			"Position.nnue_acc is declared [2][%d]). A header at any other width "+
+			"would not compile there",
+			h, v.Name, v.FixedH, v.FixedH, v.FixedH)
+	}
+	return nil
+}
+
 // SquareOf maps a board coordinate to its playable-square index, or -1.
+//
+// Draughts only. Chess positions come from FEN and are featurized by
+// internal/chess; there is no board-string coordinate to map.
 func (v *Variant) SquareOf(r, c int) int {
 	if v.AllSquares {
 		return r*v.Board + c
@@ -126,8 +234,17 @@ func (v *Variant) Bucket(pieces int) int {
 }
 
 // Mirror builds the feature permutation for a 180-degree rotation plus colour
-// swap: plane^1, and square s -> Squares-1-s. Uniform across all six variants.
+// swap: plane^1, and square s -> Squares-1-s. Uniform across all six draughts
+// variants.
+//
+// Draughts only, and returns nil for chess ON PURPOSE. The chess kernel has no
+// mirror permutation: its features are already stm-relative, so the symmetry
+// the draughts kernel recovers at the output is present in the input instead.
+// Callers must treat a nil Mirror as "single accumulator", not as an error.
 func (v *Variant) Mirror() []uint16 {
+	if v.IsChess() {
+		return nil
+	}
 	m := make([]uint16, v.NumFeat)
 	for f := 0; f < v.NumFeat; f++ {
 		p, s := f/v.Squares, f%v.Squares
@@ -283,5 +400,32 @@ func init() {
 		TBSkip:     skipTotalAtMost(2),
 		SkipDoc:    "total pieces <= 2 (3-piece tablebase territory)",
 		FeatDoc:    "feat = plane*64 + (8r + c); planes: 0 X-man, 1 O-man, 2 X-king, 3 O-king",
+	})
+
+	// ── chess / Chess960 — the other kernel family entirely. Not a board of
+	// glyphs but a FEN; not 4 absolute planes but 768 stm-relative features;
+	// not a material anchor but eval_classical(), a texel-tuned HCE that
+	// internal/chess computes per position and anchor_parity.ps1 gates against
+	// the live C engine.
+	//
+	// Board/Cells/Squares/ValMan/ValKing/AllSquares are left ZERO: they have no
+	// meaning here, and Validate() does not read them for this kernel. TBSkip
+	// is NoSkip to match chess-cli's own trainer.c, which skips nothing — the
+	// existing corpus was generated TB-less by default.
+	//
+	// Standard chess and Chess960 POOL into one net. That is what chess-cli's
+	// kit does (tools/trainer/README.txt:91-94): the eval is position-agnostic
+	// and the app ships a single net. The two data folders stay separate on
+	// disk; the loader reads both.
+	register(&Variant{
+		Name: "chess", EngineDir: "chess-cli/c_port",
+		Kernel:  KernelChess768,
+		NumFeat: 768,
+		FixedH:  256,
+		Buckets: 1, PhaseCuts: nil,
+		TBSkip:  NoSkip,
+		SkipDoc: "none (its trainer skips nothing; the corpus is TB-less by default)",
+		FeatDoc: "feat = rel_color*384 + piece_type*64 + rsq, from the SIDE TO MOVE's " +
+			"view (black-to-move flips ranks, rsq = sq^56); piece_type 0 P .. 5 K",
 	})
 }

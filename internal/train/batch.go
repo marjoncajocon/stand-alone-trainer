@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"time"
+	"unsafe"
 
 	"nnuetrainer/internal/corpus"
 	"nnuetrainer/internal/model"
@@ -48,12 +49,19 @@ type Batch struct {
 	H, NumFeat, Buckets int
 	Mirror              []uint16
 
+	// Chess selects the single-accumulator kernel: no mirror, an output bias,
+	// no 64x factor and no bucket row.
+	Chess bool
+
 	W1, B1, W2 []float32
+	B2         float32 // chess only
 
 	// optimizer state
 	m1, v1 []float32 // W1
 	mb, vb []float32 // B1
 	m2, v2 []float32 // W2
+	mB2    float32   // B2 (chess only)
+	vB2    float32
 	step   int64
 }
 
@@ -61,7 +69,9 @@ type Batch struct {
 func NewBatch(m *model.Model) *Batch {
 	b := &Batch{
 		H: m.H, NumFeat: m.NumFeat, Buckets: m.Buckets, Mirror: m.Mirror,
-		W1: f32(m.W1), B1: f32(m.B1), W2: f32(m.W2),
+		Chess: m.IsChess(),
+		W1:    f32(m.W1), B1: f32(m.B1), W2: f32(m.W2),
+		B2: float32(m.B2),
 	}
 	b.m1 = make([]float32, len(b.W1))
 	b.v1 = make([]float32, len(b.W1))
@@ -83,6 +93,9 @@ func (b *Batch) Into(m *model.Model) {
 	}
 	for i, v := range b.W2 {
 		m.W2[i] = float64(v)
+	}
+	if b.Chess {
+		m.B2 = float64(b.B2)
 	}
 }
 
@@ -107,6 +120,7 @@ func clip01f(x float32) float32 {
 // grads is one chunk's gradient accumulator.
 type grads struct {
 	w1, b1, w2 []float32
+	b2         float32 // chess only
 	acc1, acc2 []float32
 	d1, d2     []float32
 }
@@ -130,12 +144,67 @@ func (g *grads) zero() {
 	for i := range g.w2 {
 		g.w2[i] = 0
 	}
+	g.b2 = 0
 }
 
-// accumulate adds the gradients of one contiguous slice of the batch.
+// accumulateChess is the chess kernel's gradient. One accumulator, an output
+// bias, no mirror and no 64x factor:
 //
-// This is the exact computation the CUDA kernel must reproduce. Written out so
-// the two can be diffed line by line:
+//	acc  = B1 + sum_f W1[f]
+//	net  = B2 + sum_j W2[j]*crelu(acc[j])
+//	p    = sigmoid(K*(anchor + net))
+//	gr   = -2*(y-p)*p*(1-p)*K
+//	dB2      += gr
+//	dW2[j]   += gr*crelu(acc[j])
+//	d[j]      = (0<acc[j]<1) ? gr*W2[j] : 0
+//	dB1[j]   += d[j]
+//	dW1[f*H+j] += d[j]
+//
+// Note gr carries no 64: that factor is part of the DRAUGHTS kernel's output
+// scale. Chess rescales by QA*QB at quantization time instead, so the float
+// model's output is already centipawns.
+func (b *Batch) accumulateChess(g *grads, pool []uint16, batch []corpus.Sample, k float32) {
+	h := b.H
+	for _, s := range batch {
+		copy(g.acc1, b.B1)
+		for _, f := range pool[s.Off:s.End] {
+			c := int(f) * h
+			for j := 0; j < h; j++ {
+				g.acc1[j] += b.W1[c+j]
+			}
+		}
+		net := b.B2
+		for j := 0; j < h; j++ {
+			net += b.W2[j] * clip01f(g.acc1[j])
+		}
+		p := sigmoidf(k * (float32(s.Anchor) + net))
+		gr := -2 * (float32(s.Y) - p) * p * (1 - p) * k
+
+		g.b2 += gr
+		for j := 0; j < h; j++ {
+			a := clip01f(g.acc1[j])
+			g.w2[j] += gr * a
+			var d float32
+			if g.acc1[j] > 0 && g.acc1[j] < 1 {
+				d = gr * b.W2[j]
+			}
+			g.d1[j] = d
+			g.b1[j] += d
+		}
+		for _, f := range pool[s.Off:s.End] {
+			c := int(f) * h
+			for j := 0; j < h; j++ {
+				g.w1[c+j] += g.d1[j]
+			}
+		}
+	}
+}
+
+// accumulate adds the gradients of one contiguous slice of the batch, using
+// whichever kernel this net implements.
+//
+// The DRAUGHTS derivation, which is also the exact computation the CUDA kernel
+// must reproduce -- written out so the two can be diffed line by line:
 //
 //	acc1 = B1 + sum_f W1[f]          acc2 = B1 + sum_f W1[mirror(f)]
 //	net  = 64 * sum_j W2[wb+j]*(crelu(acc1[j]) - crelu(acc2[j]))
@@ -147,6 +216,10 @@ func (g *grads) zero() {
 //	dB1[j] += d1[j] + d2[j]
 //	dW1[f*H+j] += d1[j];  dW1[mirror(f)*H+j] += d2[j]
 func (b *Batch) accumulate(g *grads, pool []uint16, batch []corpus.Sample, k float32) {
+	if b.Chess {
+		b.accumulateChess(g, pool, batch, k)
+		return
+	}
 	h := b.H
 	for _, s := range batch {
 		copy(g.acc1, b.B1)
@@ -202,6 +275,11 @@ func (b *Batch) apply(g *grads, lr, scale float32, opt string) {
 		adagrad(b.W1, g.w1, b.v1, lr, scale)
 		adagrad(b.B1, g.b1, b.vb, lr, scale)
 		adagrad(b.W2, g.w2, b.v2, lr, scale)
+		if b.Chess {
+			// One-element slices so B2 goes through the SAME update rule --
+			// writing a scalar variant by hand is how the two silently drift.
+			adagrad(sliceOf(&b.B2), sliceOf(&g.b2), sliceOf(&b.vB2), lr, scale)
+		}
 	default: // adam
 		t := float64(b.step)
 		bc1 := float32(1 - math.Pow(0.9, t))
@@ -209,8 +287,16 @@ func (b *Batch) apply(g *grads, lr, scale float32, opt string) {
 		adam(b.W1, g.w1, b.m1, b.v1, lr, scale, bc1, bc2)
 		adam(b.B1, g.b1, b.mb, b.vb, lr, scale, bc1, bc2)
 		adam(b.W2, g.w2, b.m2, b.v2, lr, scale, bc1, bc2)
+		if b.Chess {
+			adam(sliceOf(&b.B2), sliceOf(&g.b2), sliceOf(&b.mB2), sliceOf(&b.vB2),
+				lr, scale, bc1, bc2)
+		}
 	}
 }
+
+// sliceOf views a scalar as a length-1 slice so it can reuse the array
+// optimizers above.
+func sliceOf(p *float32) []float32 { return unsafe.Slice(p, 1) }
 
 func adagrad(w, g, acc []float32, lr, scale float32) {
 	for i := range w {
@@ -318,6 +404,7 @@ func (b *Batch) Run(set *corpus.Set, o BatchOpts) {
 				for i := range tot.w2 {
 					tot.w2[i] += g.w2[i]
 				}
+				tot.b2 += g.b2
 			}
 			b.apply(tot, lr, 1/float32(n), o.Opt)
 		}
@@ -362,6 +449,24 @@ func (b *Batch) MSE(pool []uint16, set []corpus.Sample, k float32) float64 {
 	var e float64
 	for _, s := range set {
 		copy(acc1, b.B1)
+
+		if b.Chess {
+			for _, f := range pool[s.Off:s.End] {
+				c := int(f) * h
+				for j := 0; j < h; j++ {
+					acc1[j] += b.W1[c+j]
+				}
+			}
+			net := b.B2
+			for j := 0; j < h; j++ {
+				net += b.W2[j] * clip01f(acc1[j])
+			}
+			p := sigmoidf(k * (float32(s.Anchor) + net))
+			d := float64(float32(s.Y) - p)
+			e += d * d
+			continue
+		}
+
 		copy(acc2, b.B1)
 		for _, f := range pool[s.Off:s.End] {
 			c1 := int(f) * h
@@ -403,8 +508,8 @@ func expf(x float32) float32 {
 		return 0
 	}
 	const log2e = float32(1.4426950408889634)
-	const ln2hi = float32(0.693359375)     // exactly representable
-	const ln2lo = float32(-2.1219444e-4)   // remainder of ln2
+	const ln2hi = float32(0.693359375)   // exactly representable
+	const ln2lo = float32(-2.1219444e-4) // remainder of ln2
 	kf := x * log2e
 	var k int32
 	if kf >= 0 {

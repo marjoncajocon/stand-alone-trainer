@@ -45,28 +45,57 @@ import numpy as np
 #       i32 off, i32 end, i16 anchor, u8 bucket, f64 y
 # Train samples come first, then valid.
 
-NTC_HEADER = 104
+# NTC2 adds two u32/f64 fields after the variant name -- the KERNEL and the K
+# scale -- so this file needs no variant knowledge to know which forward pass
+# and which sigmoid scale to use. NTC1 (draughts, pre-chess) still loads.
+NTC_HEADER_V1 = 104
+NTC_HEADER_V2 = 116  # + u32 kernel + f64 kscale
 NTC_REC = np.dtype([("off", "<i4"), ("end", "<i4"), ("anchor", "<i2"),
                     ("bucket", "u1"), ("y", "<f8")])  # 19 bytes, packed
+
+KERNEL_DRAUGHTS = 0
+KERNEL_CHESS768 = 1
 
 
 def load_ntc(path):
     with open(path, "rb") as f:
         raw = f.read()
-    if raw[:4] != b"NTC1":
-        raise SystemExit(f"{path}: not an NTC1 corpus "
-                         f"(got magic {raw[:4]!r}) - produce it with: trainer --pack")
+    magic = raw[:4]
+    if magic not in (b"NTC1", b"NTC2"):
+        raise SystemExit(f"{path}: not an NTC1/NTC2 corpus "
+                         f"(got magic {magic!r}) - produce it with: trainer --pack")
     (ver,) = struct.unpack_from("<I", raw, 4)
-    if ver != 1:
-        raise SystemExit(f"{path}: unsupported version {ver}")
+    if (magic == b"NTC1" and ver != 1) or (magic == b"NTC2" and ver != 2):
+        raise SystemExit(f"{path}: unsupported {magic.decode()} version {ver}")
     variant = raw[8:24].split(b"\0")[0].decode()
-    cells, num_feat, buckets = struct.unpack_from("<III", raw, 24)
-    lines, unique, n_train, n_valid, tb_skip, eval_pos = struct.unpack_from("<6Q", raw, 36)
-    holdout, = struct.unpack_from("<I", raw, 84)
-    lam, = struct.unpack_from("<d", raw, 88)
-    pool_len, = struct.unpack_from("<Q", raw, 96)
 
-    p = NTC_HEADER
+    o = 24
+    if ver >= 2:
+        kernel, = struct.unpack_from("<I", raw, o)
+        o += 4
+    else:
+        kernel = KERNEL_DRAUGHTS
+    cells, num_feat, buckets = struct.unpack_from("<III", raw, o)
+    o += 12
+    lines, unique, n_train, n_valid, tb_skip, eval_pos = struct.unpack_from("<6Q", raw, o)
+    o += 48
+    holdout, = struct.unpack_from("<I", raw, o)
+    o += 4
+    lam, = struct.unpack_from("<d", raw, o)
+    o += 8
+    if ver >= 2:
+        kscale, = struct.unpack_from("<d", raw, o)
+        o += 8
+    else:
+        kscale = 1.0 / 256.0
+    pool_len, = struct.unpack_from("<Q", raw, o)
+    o += 8
+
+    want_header = NTC_HEADER_V2 if ver >= 2 else NTC_HEADER_V1
+    if o != want_header:
+        raise SystemExit(f"{path}: header ended at {o}, expected {want_header}")
+
+    p = o
     pool = np.frombuffer(raw, dtype="<u2", count=pool_len, offset=p)
     p += pool_len * 2
     n = n_train + n_valid
@@ -75,13 +104,15 @@ def load_ntc(path):
     if p != len(raw):
         raise SystemExit(f"{path}: trailing {len(raw) - p} bytes (truncated or corrupt)")
 
-    print(f"corpus {os.path.basename(path)}: variant={variant} cells={cells} "
-          f"feats={num_feat} buckets={buckets}")
+    kname = "chess768" if kernel == KERNEL_CHESS768 else "draughts"
+    print(f"corpus {os.path.basename(path)}: variant={variant} kernel={kname} "
+          f"cells={cells} feats={num_feat} buckets={buckets} K=1/{1 / kscale:.0f}")
     print(f"loaded {lines} lines -> {unique} UNIQUE positions "
           f"({lines / max(1, unique):.1f}x dedup) -> {n_train} train / {n_valid} valid; "
           f"skipped {tb_skip} TB-territory lines; {eval_pos} positions had eval labels "
           f"(lambda={lam:.2f})")
-    return dict(variant=variant, cells=cells, num_feat=num_feat, buckets=buckets,
+    return dict(variant=variant, kernel=kernel, cells=cells, num_feat=num_feat,
+                buckets=buckets, kscale=kscale,
                 pool=pool, recs=recs, n_train=int(n_train), n_valid=int(n_valid))
 
 
@@ -131,15 +162,46 @@ def q_round(x):
     return np.where(x >= 0, np.floor(x + 0.5), np.ceil(x - 0.5))
 
 
-def write_ntw(path, variant, w1, b1, w2, num_feat, h, buckets):
+def _flag_given(name):
+    """True if the user passed this flag, so a corpus-derived default can be
+    applied without overriding an explicit value."""
+    return any(a == name or a.startswith(name + "=") for a in sys.argv[1:])
+
+
+CHESS_QA = 255
+CHESS_QB = 64
+
+
+def write_ntw(path, variant, w1, b1, w2, num_feat, h, buckets,
+              kernel=KERNEL_DRAUGHTS, b2=0.0):
     # Quantization contract with the C engine (see internal/model/model.go):
-    #   W1q = round(W1*256) int16 clipped to +/-32000
-    #   B1q = round(B1*256) int32
-    #   W2q = round(W2*256) int16 clipped to +/-32000
+    #
+    #   draughts  W1q,W2q = round(w*256) int16 clipped +/-32000; B1q = round(b*256) i32
+    #   chess     W1q = round(w1*QA) i16; B1q = round(b1*QA) i32;
+    #             W2q = round(w2*QB) i16; B2q = round(b2*QA*QB) i32   (n2h.c:6-9)
+    #
+    # Chess writes NTW2, which is NTW1 plus a trailing i32 B2. A new magic
+    # rather than a longer NTW1 -- emit.go:112-117 records what happened the
+    # last time one magic carried two layouts.
+    name = variant.encode()[:16].ljust(16, b"\0")
+    if kernel == KERNEL_CHESS768:
+        w1q = np.clip(q_round(w1[:num_feat] * CHESS_QA), -32000, 32000).astype("<i2")
+        b1q = q_round(b1 * CHESS_QA).astype("<i4")
+        w2q = np.clip(q_round(w2 * CHESS_QB), -32000, 32000).astype("<i2")
+        b2q = np.int32(q_round(np.float64(b2) * CHESS_QA * CHESS_QB))
+        with open(path, "wb") as f:
+            f.write(b"NTW2")
+            f.write(name)
+            f.write(struct.pack("<iii", h, num_feat, buckets))
+            f.write(w1q.reshape(-1).tobytes())
+            f.write(b1q.reshape(-1).tobytes())
+            f.write(w2q.reshape(-1).tobytes())
+            f.write(struct.pack("<i", int(b2q)))
+        return w1q, b1q, w2q
+
     w1q = np.clip(q_round(w1[:num_feat] * 256), -32000, 32000).astype("<i2")
     b1q = q_round(b1 * 256).astype("<i4")
     w2q = np.clip(q_round(w2 * 256), -32000, 32000).astype("<i2")
-    name = variant.encode()[:16].ljust(16, b"\0")
     with open(path, "wb") as f:
         f.write(b"NTW1")
         f.write(name)
@@ -147,6 +209,7 @@ def write_ntw(path, variant, w1, b1, w2, num_feat, h, buckets):
         f.write(w1q.reshape(-1).tobytes())
         f.write(b1q.reshape(-1).tobytes())
         f.write(w2q.reshape(-1).tobytes())
+    return w1q, b1q, w2q
     return w1q, b1q, w2q
 
 
@@ -256,8 +319,11 @@ def resolve_corpus(args):
         # resolved it before the pack branch and refused to run without it on a
         # machine with no engine repo. Passing it costs nothing and lets this
         # work with a packer that has not been updated.
-        r = subprocess.run([packer, f"--variant={args.variant}", "--data", args.data,
-                            "--h", str(args.h), "--pack", "--out-corpus", out])
+        cmd = [packer, f"--variant={args.variant}"]
+        for g in args.data:
+            cmd += ["--data", g]
+        cmd += ["--h", str(args.h), "--pack", "--out-corpus", out]
+        r = subprocess.run(cmd)
     except OSError as e:
         raise SystemExit(
             f"error: could not run the packer ({e}).\n"
@@ -276,9 +342,11 @@ def main():
         description="GPU NNUE training. Give it either a packed --corpus, or raw "
                     "--data text plus --variant and it will pack for you.")
     ap.add_argument("--corpus", default="", help="packed .ntc from: trainer --pack")
-    ap.add_argument("--data", default="",
-                    help="glob of raw selfplay .txt (QUOTE IT). Packs first, using the Go "
-                         "binary - the loader is not reimplemented here on purpose")
+    ap.add_argument("--data", action="append", default=[],
+                    help="glob of raw selfplay .txt (QUOTE IT). Repeatable - chess "
+                         "needs two (data/chess and data/chess960), which pool into "
+                         "one net. Packs first, using the Go binary; the loader is "
+                         "not reimplemented here on purpose")
     ap.add_argument("--variant", default="filipino",
                     help="only needed with --data; a .ntc already carries its variant")
     ap.add_argument("--packer", default="",
@@ -333,38 +401,65 @@ def main():
 
     c = load_ntc(corpus_path)
     num_feat, buckets, H = c["num_feat"], c["buckets"], args.h
+    is_chess = c["kernel"] == KERNEL_CHESS768
+
+    # The chess engine static-asserts NNUE_HID == 256 (nnue.c:14), so any other
+    # width produces a header it cannot compile. Fail here rather than after a
+    # 40-epoch Colab run.
+    if is_chess and H != 256:
+        raise SystemExit(f"--h {H} is not usable for chess: its engine pins the "
+                         f"accumulator width at 256 (nnue.c:14 static-asserts "
+                         f"NNUE_HID == 256). Pass --h 256.")
+
     feats_np, max_len = pad_features(c["pool"], c["recs"], num_feat)
     print(f"feature matrix: {feats_np.shape} (max {max_len} pieces per position)")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    mir = torch.from_numpy(mirror_table(num_feat)).to(dev)
+    # No mirror table for chess: its features are already stm-relative, so the
+    # symmetry the draughts kernel recovers at the output is in the input.
+    mir = None if is_chess else torch.from_numpy(mirror_table(num_feat)).to(dev)
     feats = torch.from_numpy(feats_np).to(dev)                       # (N, L) int32
     anchor = torch.from_numpy(c["recs"]["anchor"].astype(np.float32)).to(dev)
     bucket = torch.from_numpy(c["recs"]["bucket"].astype(np.int64)).to(dev)
     y = torch.from_numpy(c["recs"]["y"].astype(np.float32)).to(dev)
     n_train, n_valid = c["n_train"], c["n_valid"]
 
-    # Model. W1 is ONE shared table evaluated twice (board and mirror) - that is
-    # what makes f(b) = g(b) - g(mirror(b)) structurally antisymmetric, so the
-    # property survives quantization exactly. Never add a second head.
+    # Model. For DRAUGHTS, W1 is ONE shared table evaluated twice (board and
+    # mirror) - that is what makes f(b) = g(b) - g(mirror(b)) structurally
+    # antisymmetric, so the property survives quantization exactly. Never add a
+    # second head there.
+    #
+    # For CHESS the kernel is different, not a variation: one accumulator, a
+    # scalar output bias, no 64x factor and no bucket row (nnue.c:73-88).
     emb = nn.EmbeddingBag(num_feat + 1, H, mode="sum", padding_idx=num_feat).to(dev)
     with torch.no_grad():
         emb.weight.uniform_(-0.3, 0.3)
         emb.weight[num_feat].zero_()
     b1 = nn.Parameter(torch.full((H,), 0.05, device=dev))
     w2 = nn.Parameter(torch.empty(buckets, H, device=dev).uniform_(-0.5, 0.5))
+    b2 = nn.Parameter(torch.zeros((), device=dev))
 
     params = list(emb.parameters()) + [b1, w2]
+    if is_chess:
+        params.append(b2)
     opt = (torch.optim.Adam(params, lr=args.lr) if args.opt == "adam"
            else torch.optim.Adagrad(params, lr=args.lr))
 
-    K = args.k
+    # K comes from the CORPUS, not the CLI default: chess's sigmoid is /400
+    # (trainer.c:49) and draughts' is /256, and it is a property of the data's
+    # engine, not a knob. An explicit --k still wins.
+    K = args.k if _flag_given("--k") else c["kscale"]
+    if K != args.k:
+        print(f"using K=1/{1 / K:.0f} from the corpus (pass --k to override)")
 
     def forward(idx):
         f = feats[idx].long()
         acc1 = emb(f) + b1
+        if is_chess:
+            o = (acc1.clamp(0, 1) * w2[0]).sum(1) + b2
+            return torch.sigmoid(K * (anchor[idx] + o))
         acc2 = emb(mir[f]) + b1
         a1 = acc1.clamp(0, 1)
         a2 = acc2.clamp(0, 1)
@@ -381,12 +476,13 @@ def main():
             seen += len(idx)
         return tot / max(1, seen)
 
-    # Anchor-only baseline: what the frozen material term alone scores. Any net
-    # that cannot beat this is worse than counting pieces.
+    # Anchor-only baseline: what the frozen anchor alone scores. Any net that
+    # cannot beat this has learned nothing useful.
     with torch.no_grad():
         vi = torch.arange(n_train, n_train + n_valid, device=dev)
         d = y[vi] - torch.sigmoid(K * anchor[vi])
-        print(f"valid MSE, anchor-only (material): {float((d * d).mean()):.6f}")
+        kind = "eval_classical" if is_chess else "material"
+        print(f"valid MSE, anchor-only ({kind}): {float((d * d).mean()):.6f}")
 
     print(f"variant={c['variant']}  H={H}  feats={num_feat}  buckets={buckets}  "
           f"opt={args.opt}  epochs={args.epochs}  batch={args.batch}  lr={args.lr}  "
@@ -427,21 +523,31 @@ def main():
     w1 = emb.weight.detach().cpu().numpy().astype(np.float64)
     b1n = b1.detach().cpu().numpy().astype(np.float64)
     w2n = w2.detach().cpu().numpy().astype(np.float64)
+    b2n = float(b2.detach().cpu().numpy())
 
     out = args.out or f"nn_{c['variant']}_h{H}.ntw"
-    w1q, b1q, w2q = write_ntw(out, c["variant"], w1, b1n, w2n, num_feat, H, buckets)
+    w1q, b1q, w2q = write_ntw(out, c["variant"], w1, b1n, w2n, num_feat, H, buckets,
+                              kernel=c["kernel"], b2=b2n)
 
-    # int16 accumulator safety. search.c sums into int16 seeded by narrowing the
-    # int32 NN_B1; that is only legal while the pre-clamp sum stays inside
-    # +/-32767. An overflow silently changes the eval with no symptom except
-    # worse play, so this is checked before the header is ever generated.
+    # int16 accumulator safety. The draughts search.c sums into int16 seeded by
+    # narrowing the int32 NN_B1; that is only legal while the pre-clamp sum
+    # stays inside +/-32767. An overflow silently changes the eval with no
+    # symptom except worse play, so this is checked before the header exists.
     worst_hi = int(b1q.max() + np.sort(w1q, axis=0)[-max_len:].sum(0).max())
     worst_lo = int(b1q.min() + np.sort(w1q, axis=0)[:max_len].sum(0).min())
-    print(f"accumulator bound (worst case over {max_len} pieces): "
-          f"HI {worst_hi:+d}  LO {worst_lo:+d}  (int16 limit +/-32767)")
-    if worst_hi > 32767 or worst_lo < -32767:
-        print("ACCUMULATOR OVERFLOW - do not install this net. Lower --lr or add clipping.")
-        sys.exit(4)
+    if is_chess:
+        # Chess accumulates in int32 in the engine too (position.h:34-42), so
+        # this is information, not a gate. Applying the int16 limit here would
+        # reject perfectly good nets.
+        print(f"accumulator bound (worst case over {max_len} pieces): "
+              f"HI {worst_hi:+d}  LO {worst_lo:+d}")
+        print("  chess accumulates in int32 by design - no int16 gate applies.")
+    else:
+        print(f"accumulator bound (worst case over {max_len} pieces): "
+              f"HI {worst_hi:+d}  LO {worst_lo:+d}  (int16 limit +/-32767)")
+        if worst_hi > 32767 or worst_lo < -32767:
+            print("ACCUMULATOR OVERFLOW - do not install this net. Lower --lr or add clipping.")
+            sys.exit(4)
 
     print(f"wrote {out}  ({time.time() - t_start:.0f}s total)")
 

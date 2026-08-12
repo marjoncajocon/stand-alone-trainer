@@ -1,8 +1,9 @@
 # stand-alone-trainer
 
-One NNUE trainer for **all six checkers/draughts engines** in this workspace.
-Written in Go, cross-compiles from Windows with no C toolchain, and grows an
-optional CUDA backend when built on Colab.
+One NNUE trainer for **all seven engines** in this workspace — the six
+checkers/draughts variants and chess. Written in Go, cross-compiles from
+Windows with no C toolchain, and grows an optional CUDA backend when built on
+Colab.
 
 Everything is flat — binaries, scripts and `data/` all sit at the kit root.
 
@@ -11,20 +12,50 @@ BUILD.bat                                   # builds trainer_win_x64.exe + train
 .\trainer_win_x64.exe --list-variants
 ```
 
-| Variant | Engine | Board | Feats | W2 buckets | Man/King |
+| Variant | Engine | Board | Feats | W2 buckets | Anchor |
 |---|---|---|---|---|---|
-| filipino | `dama-cli` | 8x8 diag | 128 | 4 | 100 / 320 |
-| brazilian | `brazilian-cli` | 8x8 diag | 128 | 4 | 100 / 320 |
-| english | `english-dama-cli` | 8x8 diag | 128 | **1** | 100 / **150** |
-| russian | `rusian-dama-cli` | 8x8 diag | 128 | **1** | 100 / 320 |
-| international | `international-dama-cli` | **10x10** | **200** | **1** | 100 / 320 |
-| turkish | `turkish-cli` | 8x8 **all sq** | **256** | 4 | 100 / 320 |
+| filipino | `dama-cli` | 8x8 diag | 128 | 4 | man 100 / king 320 |
+| brazilian | `brazilian-cli` | 8x8 diag | 128 | 4 | man 100 / king 320 |
+| english | `english-dama-cli` | 8x8 diag | 128 | **1** | man 100 / king **150** |
+| russian | `rusian-dama-cli` | 8x8 diag | 128 | **1** | man 100 / king 320 |
+| international | `international-dama-cli` | **10x10** | **200** | **1** | man 100 / king 320 |
+| turkish | `turkish-cli` | 8x8 **all sq** | **256** | 4 | man 100 / king 320 |
+| **chess** | `chess-cli` | FEN | **768** | **1** | **`eval_classical`** |
 
 Every constant was read out of that repo's own trainer, not guessed. **Buckets
 is what that engine's `search.c` implements today** — `english`, `russian` and
 `international` have no `NN_W2_BUCKETS` branch at all, so they get a single W2
 and the generated header omits the `#define` entirely. Ask for more and the
 trainer warns you the header will not compile there.
+
+## Chess is the other KERNEL, not a seventh variant
+
+The six draughts engines share one integer kernel. Chess does not, so it is a
+second kernel family rather than another descriptor:
+
+| | draughts | chess |
+|---|---|---|
+| input | board string, 4 absolute planes | FEN, 768 **stm-relative** features |
+| symmetry | `f(b) = g(b) − g(mirror(b))`, at the OUTPUT | in the input encoding |
+| accumulators | two (board + mirror) | **one** |
+| output bias | none | **`b2`** |
+| quantization | ×256, clamp `[0,256]` | **QA=255, QB=64**, clamp `[0,255]` |
+| header symbols | `NN_W1/NN_B1/NN_W2` + `#define`s | `nnue_w1/b1/w2/b2`, flat, no defines |
+| anchor | frozen material count | **`eval_classical()`**, a texel-tuned HCE |
+| `--h` | reads the engine's shipped `NN_H` | **pinned 256** (`nnue.c` static-asserts it) |
+| int16 accumulator gate | applies | **N/A** — that engine uses int32 too |
+
+The anchor is the part that costs something. Chess's net is a *residue* on
+`eval_classical()`, so the trainer has to compute that per position; the port
+lives in `internal/chess/` and is gated exactly against `chess-cli/c_port` by
+`anchor_parity.ps1`. **Re-run that gate after any texel retune** — the anchor is
+frozen into the `.ntc` at pack time, so a drifted copy trains cleanly on Colab
+and yields a net fitted against an eval the engine does not compute. There is no
+other symptom.
+
+Standard chess and Chess960 **pool into one net**, which is what `chess-cli`'s
+own kit does: the eval is position-agnostic and the app ships a single net.
+`--variant=chess` reads both `data\chess\` and `data\chess960\`.
 
 ## Where the data goes
 
@@ -114,10 +145,23 @@ sha256 `1B975BED...`.
 ## The gate chain — nothing ships until all of it passes
 
 ```powershell
-.\parity.ps1 -Bin nn_filipino_h256.ntw
+.\parity.ps1 -Bin nn_filipino_h256.ntw        # the six draughts engines
+.\anchor_parity.ps1                            # chess: the anchor. Before EVERY --pack.
+.\parity_chess.ps1 -Bin nn_chess_h256.ntw      # chess: anchor + kernel + quantizer
 ```
 
-runs the first three at once. In order of what they catch:
+`parity_chess.ps1` has three legs, all compiled fresh against the live
+`chess-cli/c_port` sources: Go `eval_classical` vs `eval.c`; Go `ScoreCP` vs
+`nnue.c` compiled against the header we generate; and our `net.bin` fed through
+`chess-cli`'s **own `n2h.exe`**, whose header must come out byte-identical to
+ours. That last one validates every quantization scale at once against the tool
+that produced every shipped chess header so far — it is what makes `trainer.c`
+and `n2h.c` genuinely redundant rather than merely duplicated.
+
+It reports the int16 narrow-accumulator leg as **N/A** rather than passing it,
+because chess's engine accumulates in int32 by design.
+
+The draughts chain, in order of what it catches:
 
 1. **Probe parity, int32.** Our integer reference vs C compiled against the
    header **we generate**. Validates feature extraction, the mirror permutation,
@@ -154,7 +198,35 @@ runs the first three at once. In order of what they catch:
 - end-to-end training on the live filipino corpus; header emits, accbound clears
 - both binaries build; `go vet` and `go test` clean
 
+**Verified for chess specifically:**
+
+- **anchor parity, 20,000 real corpus FENs, 0 mismatches** — Go `eval_classical`
+  against a probe compiled from the live `chess-cli/c_port/eval.c`, strided
+  across all 12 corpus files so the sample reaches endgames, not just openings
+- **kernel parity, 400 FENs, 0 mismatches** — Go `ScoreCP` against `nnue.c`
+  compiled against our generated header
+- **quantizer: header body byte-identical to `n2h.exe`** (730,720 bytes)
+- 50,000 FENs round-trip `FromFEN → ToFEN` byte-identically
+- `--threads` determinism holds for the new kernel: 1 / 4 / 16 all produced the
+  same `.ntw`
+- a Python-written chess `.ntw` is **byte-identical** to the Go one
+  (`tools/check_gpu_writer.py`), so `train_gpu.py`'s NTC2 reader, NTW2 writer and
+  QA/QB scales all agree with Go
+- end-to-end: pack → train → quantize → header, on a real 20k-line corpus slice;
+  holdout MSE falls monotonically and beats the anchor-only baseline
+- the six draughts variants are unaffected: `parity.ps1` still 350/350
+
 **NOT yet verified — do not treat as working:**
+
+- **No chess net has been trained on the full corpus, and none has played a
+  game.** The gates above prove the artifact is *correct*, not that it is
+  *stronger*. The decision to ship is still `abmatch.exe` vs the tuned classical
+  engine on both standard and 960 — reject <48%, accept ≥51.5%.
+- **The shipped app is classical-only today.** `chess_master`'s Android
+  `CMakeLists.txt` compiles `eval.c` but not `nnue.c` and defines no
+  `USE_NNUE`. Turning that on is a separate decision, out of scope here.
+- **The PyTorch loop for chess has not been run**, only its byte-level contracts
+  with Go. Same status as the draughts path.
 
 - **The CUDA path has never been compiled or run.** There is no nvcc on this
   machine. `internal/gpu/kernels.cu` is written to mirror
@@ -167,6 +239,27 @@ runs the first three at once. In order of what they catch:
   packed corpus and require a 3-seed MSE win before trusting it.
 - **Only `filipino` has a live corpus.** The other five descriptors are correct
   by construction and by the parity gate, but untested against real data.
+
+## A bug this replaces: chess-cli's trainer.c drops ~19% of every corpus
+
+`chess-cli/c_port/tools/trainer.c:106` finds the result token by substring
+search, with the comment *"FENs never contain these substrings"*. That is
+false. A FEN's placement field contains **`1/2`** whenever a rank ends with one
+empty square and the next begins with two — `rnbqkbn1/2pppppp/...`. `strstr`
+then matches inside the FEN, line 126 truncates the string there, `pos_from_fen`
+fails, and the line is **silently discarded**.
+
+Measured on 8 corpus files: 2,245,788 lines total. This trainer reads all of
+them; `trainer.c` reads 1,825,852 and drops **419,936 — exactly the number of
+lines whose placement field contains `1/2`**, matching to the line.
+
+It is not a random 19% either. It selects for a specific emptiness pattern, so
+the discarded set is structurally biased rather than a uniform sample. Every
+chess NNUE net trained with that kit was fitted on the surviving 81%.
+
+This loader parses by FIELD POSITION (`fenSpan`), so it cannot go wrong the same
+way — and it is why the "line" counters here will not match a historical
+`trainer.c` log on the same data.
 
 ## MSE numbers are corpus-relative
 
@@ -189,12 +282,18 @@ parity.ps1                              the acceptance gate
 data/<variant>/                         corpora (gitignored)
 
 cmd/trainer/          CLI
-internal/variant/     the six descriptors - the ONLY place geometry differs
-internal/corpus/      load, dedup, holdout, .ntc pack
-internal/model/       weights, quantization, int32 + int16 references, accbound
-internal/emit/        nnue_weights.h writer, .ntw, legacy DNN1/DNN2 readers
-internal/train/       online.go (oracle), batch.go (production)
+internal/variant/     the seven descriptors + the Kernel discriminator
+internal/corpus/      load, dedup, holdout, .ntc pack (both line formats)
+internal/model/       weights, quantization, integer references, accbound
+internal/emit/        nnue_weights.h writers, .ntw, net.bin, legacy readers
+internal/train/       online.go (draughts oracle), batch.go (production)
+internal/chess/       FEN, bitboards, eval_classical, 768 features
 internal/gpu/         interface, !cuda stub, cuda cgo wrapper, kernels.cu
+tools/                check_gpu_writer.py (Go-vs-Python byte identity)
 ```
 
-Adding a variant is one struct literal in `internal/variant/variant.go`.
+Adding a **draughts** variant is one struct literal in
+`internal/variant/variant.go`. Adding another *kernel* is not — chess needed a
+branch in `variant`, `corpus`, `model`, `emit`, `train` and `train_gpu.py`, plus
+two new gate scripts. If a future engine shares the chess kernel it is one
+struct literal again.
