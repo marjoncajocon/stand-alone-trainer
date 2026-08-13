@@ -160,6 +160,37 @@ func chessOutcome(tok []byte) (float64, bool) {
 	return 0, false
 }
 
+// draughtsAccept is the ONE definition of a well-formed draughts line. Load
+// gates on it immediately before nLines++, and count.go's Count calls the same
+// function, so an inventory can never disagree with what training reads.
+//
+// A wrong-length board is the common real failure: it means --variant names a
+// different geometry than the data (64 vs 100 cells), and rejecting the line is
+// what makes that visible as "everything malformed" rather than as a net that
+// trains on nothing.
+func draughtsAccept(parts [][]byte, cells int) bool {
+	return len(parts) >= 3 && len(parts[0]) == cells
+}
+
+// chessAccept is the same contract for a chess line: it parses the FEN into pos
+// and returns WHITE's outcome. Two callers, one definition (see count.go).
+//
+// pos is written even when the outcome token turns out to be bad; callers only
+// read it when ok is true.
+func chessAccept(line []byte, parts [][]byte, pos *chess.Position) (float64, bool) {
+	if len(parts) < 8 {
+		return 0, false
+	}
+	// The FEN is a contiguous prefix of the line, so slice it out rather than
+	// rejoining the six tokens -- at this scale a per-line join would be pure
+	// garbage.
+	n := fenSpan(line)
+	if n < 0 || !pos.FromFENBytes(line[:n]) {
+		return 0, false
+	}
+	return chessOutcome(parts[6])
+}
+
 // fields splits on whitespace into at most max slices, without allocating.
 // Semantics match strings.Fields for the data this reads.
 func fields(line []byte, out [][]byte) [][]byte {
@@ -313,18 +344,7 @@ func Load(v *variant.Variant, o Options) (*Set, error) {
 
 			if isChess {
 				// <fen(6 fields)> <result> <gameid> [<eval>]
-				if len(parts) < 8 {
-					continue
-				}
-				// The FEN is a contiguous prefix of the line, so slice it out
-				// rather than rejoining the six tokens -- at this scale a
-				// per-line join would be pure garbage.
-				line := sc.Bytes()
-				n := fenSpan(line)
-				if n < 0 || !pos.FromFENBytes(line[:n]) {
-					continue
-				}
-				wr, okRes := chessOutcome(parts[6])
+				wr, okRes := chessAccept(sc.Bytes(), parts, &pos)
 				if !okRes {
 					continue
 				}
@@ -351,13 +371,13 @@ func Load(v *variant.Variant, o Options) (*Set, error) {
 				}
 				pos.PackKey(key[:])
 			} else {
-				if len(parts) < 3 || len(parts[0]) != v.Cells {
+				if !draughtsAccept(parts, v.Cells) {
 					continue
 				}
 				nLines++
 				board := parts[0]
 
-				xm, om, xk, ok := v.Counts(string(board))
+				xm, om, xk, ok := v.Counts(board)
 				if v.TBSkip(xm, om, xk, ok) {
 					nTBSkip++
 					continue
@@ -554,36 +574,165 @@ func (s *Set) Save(path string) error {
 	return w.Flush()
 }
 
+// NTCHeaderMax is the largest packed-corpus header: 116 bytes for NTC2, 104 for
+// NTC1. Reading this many bytes is enough to report every counter a .ntc
+// carries, which is what lets cmd/count inventory a 100 MB corpus instantly.
+const NTCHeaderMax = 128
+
+// PackedInfo is everything a .ntc header carries.
+//
+// Note what is NOT in here: a GAME count. The format has never had one, so a
+// tool reading only the header cannot report games -- see count.go and the "-"
+// in cmd/count's GAMES column for packed sources.
+type PackedInfo struct {
+	Path      string
+	Magic     string
+	Version   int
+	Name      string
+	Kernel    variant.Kernel // meaningful only when Version >= 2
+	HasKernel bool
+	Cells     int
+	NumFeat   int
+	Buckets   int
+	Stats     Stats
+	PoolLen   int64
+	HeaderLen int
+}
+
+// parseNTCHeader decodes the fixed-size header and returns the bytes consumed.
+//
+// LoadPacked and PackedHeader share it so the field ORDER lives in exactly one
+// place. The variant cross-checks deliberately stay in LoadPacked: it is the
+// only one of the two that has a variant to check against.
+func parseNTCHeader(path string, raw []byte) (*PackedInfo, int, error) {
+	p := 0
+	// need guards every read: a truncated header must report "truncated", not
+	// panic with an index-out-of-range. A packed corpus is the artifact that
+	// travels to Colab and back, so a half-copied file is realistic.
+	need := func(n int) error {
+		if p+n > len(raw) {
+			return fmt.Errorf("%s: header truncated at byte %d (need %d more)", path, p, n)
+		}
+		return nil
+	}
+	if err := need(4); err != nil {
+		return nil, 0, fmt.Errorf("%s: too short to be a packed corpus", path)
+	}
+	magic := string(raw[:4])
+	if magic != ntcMagic && magic != ntcMagicV1 {
+		return nil, 0, fmt.Errorf("%s: not an %s or %s corpus", path, ntcMagic, ntcMagicV1)
+	}
+	p = 4
+
+	var perr error
+	g32 := func() uint32 {
+		if perr == nil {
+			perr = need(4)
+		}
+		if perr != nil {
+			return 0
+		}
+		x := binary.LittleEndian.Uint32(raw[p:])
+		p += 4
+		return x
+	}
+	g64 := func() uint64 {
+		if perr == nil {
+			perr = need(8)
+		}
+		if perr != nil {
+			return 0
+		}
+		x := binary.LittleEndian.Uint64(raw[p:])
+		p += 8
+		return x
+	}
+	gF := func() float64 { return math.Float64frombits(g64()) }
+
+	ver := g32()
+	if perr != nil {
+		return nil, 0, perr
+	}
+	if (magic == ntcMagicV1 && ver != 1) || (magic == ntcMagic && ver != 2) {
+		return nil, 0, fmt.Errorf("%s: unsupported %s version %d", path, magic, ver)
+	}
+	if err := need(16); err != nil {
+		return nil, 0, err
+	}
+	nameRaw := raw[p : p+16]
+	p += 16
+	info := &PackedInfo{
+		Path:    path,
+		Magic:   magic,
+		Version: int(ver),
+		Name:    string(nameRaw[:clen(nameRaw)]),
+	}
+	if ver >= 2 {
+		info.Kernel, info.HasKernel = variant.Kernel(g32()), true
+	}
+	info.Cells, info.NumFeat, info.Buckets = int(g32()), int(g32()), int(g32())
+
+	st := Stats{Lambda: 0, Holdout: 0}
+	st.Lines = int64(g64())
+	st.Unique = int64(g64())
+	st.Train = int64(g64())
+	st.Valid = int64(g64())
+	st.TBSkip = int64(g64())
+	st.EvalPos = int64(g64())
+	st.Holdout = int(g32())
+	st.Lambda = gF()
+	if ver >= 2 {
+		st.KScale = gF()
+	}
+	info.Stats = st
+	info.PoolLen = int64(g64())
+	if perr != nil {
+		return nil, 0, perr
+	}
+	info.HeaderLen = p
+	return info, p, nil
+}
+
+// PackedHeader reports a packed corpus's counters without reading its body --
+// data\chess.ntc is ~100 MB and the header is 116 bytes.
+//
+// It does NOT check the file against a variant (that is LoadPacked's job) and it
+// does NOT validate the body length, because it never reads the body. A caller
+// that needs the data itself must use LoadPacked.
+func PackedHeader(path string) (*PackedInfo, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, NTCHeaderMax)
+	// A valid NTC1 file with an empty body is shorter than NTCHeaderMax, so a
+	// short read is not an error here -- parseNTCHeader's own bounds checks
+	// decide whether what arrived is enough.
+	n, err := io.ReadFull(f, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return nil, err
+	}
+	info, _, err := parseNTCHeader(path, buf[:n])
+	return info, err
+}
+
 // LoadPacked reads a packed corpus and verifies it matches the variant.
 func LoadPacked(v *variant.Variant, path string, quiet bool) (*Set, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	if len(raw) < 4 {
-		return nil, fmt.Errorf("%s: too short to be a packed corpus", path)
+	info, p, err := parseNTCHeader(path, raw)
+	if err != nil {
+		return nil, err
 	}
-	magic := string(raw[:4])
-	if magic != ntcMagic && magic != ntcMagicV1 {
-		return nil, fmt.Errorf("%s: not an %s or %s corpus", path, ntcMagic, ntcMagicV1)
-	}
-	p := 4
-	g32 := func() uint32 { x := binary.LittleEndian.Uint32(raw[p:]); p += 4; return x }
-	g64 := func() uint64 { x := binary.LittleEndian.Uint64(raw[p:]); p += 8; return x }
-	gF := func() float64 { x := math.Float64frombits(binary.LittleEndian.Uint64(raw[p:])); p += 8; return x }
-
-	ver := g32()
-	if (magic == ntcMagicV1 && ver != 1) || (magic == ntcMagic && ver != 2) {
-		return nil, fmt.Errorf("%s: unsupported %s version %d", path, magic, ver)
-	}
-	nameRaw := raw[p : p+16]
-	p += 16
-	name := string(nameRaw[:clen(nameRaw)])
+	name := info.Name
 	if name != v.Name {
 		return nil, fmt.Errorf("%s holds variant %q but --variant is %q", path, name, v.Name)
 	}
-	if ver >= 2 {
-		if k := variant.Kernel(g32()); k != v.Kernel {
+	if info.HasKernel {
+		if k := info.Kernel; k != v.Kernel {
 			return nil, fmt.Errorf("%s was packed for the %s kernel but %s uses %s",
 				path, k, v.Name, v.Kernel)
 		}
@@ -593,25 +742,14 @@ func LoadPacked(v *variant.Variant, path string, quiet bool) (*Set, error) {
 		return nil, fmt.Errorf("%s is an %s corpus, which cannot hold chess data; repack it",
 			path, ntcMagicV1)
 	}
-	cells, numFeat, buckets := int(g32()), int(g32()), int(g32())
+	cells, numFeat, buckets := info.Cells, info.NumFeat, info.Buckets
 	if cells != v.Cells || numFeat != v.NumFeat {
 		return nil, fmt.Errorf("%s: geometry mismatch (cells %d/%d, feats %d/%d)",
 			path, cells, v.Cells, numFeat, v.NumFeat)
 	}
-	st := Stats{Lambda: 0, Holdout: 0}
-	st.Lines = int64(g64())
-	st.Unique = int64(g64())
-	nTrain := int64(g64())
-	nValid := int64(g64())
-	st.TBSkip = int64(g64())
-	st.EvalPos = int64(g64())
-	st.Holdout = int(g32())
-	st.Lambda = gF()
-	if ver >= 2 {
-		st.KScale = gF()
-	}
-	st.Train, st.Valid = nTrain, nValid
-	poolLen := int(g64())
+	st := info.Stats
+	nTrain, nValid := st.Train, st.Valid
+	poolLen := int(info.PoolLen)
 
 	// Check the body length BEFORE reading it. The trailing-byte check at the
 	// end only catches a file that is too long; a SHORT one would run off the

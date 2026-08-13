@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"nnuetrainer/internal/corpus"
+	"nnuetrainer/internal/datadir"
 	"nnuetrainer/internal/emit"
 	"nnuetrainer/internal/gpu"
 	"nnuetrainer/internal/model"
@@ -35,11 +36,18 @@ type multiFlag []string
 func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
 func (m *multiFlag) Set(s string) error { *m = append(*m, s); return nil }
 
+// buildHash and buildDate are injected by build_all.ps1's -ldflags -X. They
+// have to be DECLARED for that to do anything: the build script has passed
+// -X main.buildHash since day one, and until these existed the linker had
+// nowhere to write it, so the provenance stamp was silently dropped.
+var buildHash, buildDate string
+
 func main() {
 	var data multiFlag
 
 	variantName := flag.String("variant", "filipino", "which engine to train for; --list-variants to see all")
 	listVariants := flag.Bool("list-variants", false, "print the variant table and exit")
+	version := flag.Bool("version", false, "print the build stamp and exit")
 	flag.Var(&data, "data", "glob of selfplay text files (repeatable). "+
 		"Default: data\\<variant>\\*.txt beside the binary, or a packed data\\<variant>.ntc")
 	corpusPath := flag.String("corpus", "", "packed .ntc corpus (mutually exclusive with --data)")
@@ -84,6 +92,10 @@ func main() {
 
 	flag.Parse()
 
+	if *version {
+		printVersion("trainer")
+		return
+	}
 	if *listVariants {
 		printVariants()
 		return
@@ -246,7 +258,7 @@ func main() {
 	// packed data/<variant>.ntc wins if present, since it is both faster and
 	// split-frozen.
 	if *corpusPath == "" && len(data) == 0 {
-		if pk, globs, where := discoverData(v); pk != "" {
+		if pk, globs, where := datadir.Discover(v); pk != "" {
 			*corpusPath = pk
 			fmt.Printf("using packed corpus %s\n", pk)
 		} else if len(globs) > 0 {
@@ -256,7 +268,7 @@ func main() {
 			}
 		} else {
 			want := ""
-			for _, f := range dataFolders(v) {
+			for _, f := range datadir.Folders(v) {
 				want += fmt.Sprintf("  Expected  data\\%s\\*.txt\n", f)
 			}
 			die(2, "no data found.\n"+
@@ -517,6 +529,21 @@ func packForGPU(set *corpus.Set) *gpu.Corpus {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+// printVersion reports the source hash build_all.ps1 stamped in. Two binaries
+// ship from one source tree, so the hash is what tells you whether the one you
+// are holding was built from the same sources as its sibling.
+func printVersion(name string) {
+	h, d := buildHash, buildDate
+	if h == "" {
+		h = "unstamped (built by hand, not build_all.ps1)"
+	}
+	if d == "" {
+		d = "unknown"
+	}
+	fmt.Printf("%s  source hash %s  built %s  %s/%s\n",
+		name, h, d, runtime.GOOS, runtime.GOARCH)
+}
+
 func printVariants() {
 	fmt.Printf("%-14s %-30s %-9s %5s %6s %7s %6s  %s\n",
 		"VARIANT", "ENGINE", "KERNEL", "CELLS", "FEATS", "BUCKETS", "H", "ANCHOR")
@@ -576,29 +603,6 @@ func shippedH(workspace string, v *variant.Variant) int {
 	return n
 }
 
-// dataRoots lists where a corpus is looked for, in priority order: beside the
-// binary first (bin\data\<variant>, the same convention stand-alone-selfplay
-// uses for --out-dir), then the kit root, then the current directory.
-func dataRoots() []string {
-	var roots []string
-	if exe, err := os.Executable(); err == nil {
-		d := filepath.Dir(exe)
-		roots = append(roots, filepath.Join(d, "data"), filepath.Join(d, "..", "data"))
-	}
-	if wd, err := os.Getwd(); err == nil {
-		roots = append(roots, filepath.Join(wd, "data"))
-	}
-	seen := map[string]bool{}
-	var out []string
-	for _, r := range roots {
-		if abs, err := filepath.Abs(r); err == nil && !seen[abs] {
-			seen[abs] = true
-			out = append(out, abs)
-		}
-	}
-	return out
-}
-
 // flagPassed reports whether the user actually gave this flag, so a per-variant
 // default can be applied without overriding an explicit value.
 func flagPassed(name string) bool {
@@ -609,48 +613,6 @@ func flagPassed(name string) bool {
 		}
 	})
 	return found
-}
-
-// dataFolders lists the data/<folder> directories a variant reads.
-//
-// Chess reads TWO: standard and Chess960 pool into one net, because the eval is
-// position-agnostic and the app ships a single net -- the same choice
-// chess-cli's own kit makes (tools/trainer/README.txt:91-94). The folders stay
-// separate on disk so the generator can keep them from mixing by accident
-// (stand-alone-selfplay's SP_TOKEN_FOR), and the loader's holdout group key
-// uses the folder name so a standard file and a 960 file with the same
-// basename never share a group.
-func dataFolders(v *variant.Variant) []string {
-	if v.IsChess() {
-		return []string{"chess", "chess960"}
-	}
-	return []string{v.Name}
-}
-
-// discoverData finds a corpus for v without any flags. Returns (packedPath,
-// textGlobs, searchedDescription); at most one of the first two is non-empty.
-func discoverData(v *variant.Variant) (string, []string, string) {
-	var searched strings.Builder
-	folders := dataFolders(v)
-	for _, root := range dataRoots() {
-		fmt.Fprintf(&searched, "    %s\n", root)
-		// A packed corpus wins: faster to load and its split is frozen.
-		pk := filepath.Join(root, v.Name+".ntc")
-		if _, err := os.Stat(pk); err == nil {
-			return pk, nil, ""
-		}
-		var globs []string
-		for _, f := range folders {
-			glob := filepath.Join(root, f, "*.txt")
-			if m, err := filepath.Glob(glob); err == nil && len(m) > 0 {
-				globs = append(globs, glob)
-			}
-		}
-		if len(globs) > 0 {
-			return "", globs, ""
-		}
-	}
-	return "", nil, searched.String()
 }
 
 // resolveRepo finds the workspace root that holds the engine repos.

@@ -253,8 +253,12 @@ func (v *Variant) Mirror() []uint16 {
 	return m
 }
 
-// Counts tallies the four piece kinds on a board string.
-func (v *Variant) Counts(b string) (xMen, oMen, xKings, oKings int) {
+// Counts tallies the four piece kinds on a board.
+//
+// It takes []byte rather than string because every caller has a []byte slice of
+// a scanned line: a string conversion of a 64- or 100-byte board exceeds the
+// compiler's stack-temp limit, so it would heap-allocate once per data line.
+func (v *Variant) Counts(b []byte) (xMen, oMen, xKings, oKings int) {
 	for i := 0; i < v.Cells; i++ {
 		switch b[i] {
 		case 'X':

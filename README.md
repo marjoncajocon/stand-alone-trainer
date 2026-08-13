@@ -8,8 +8,9 @@ Colab.
 Everything is flat — binaries, scripts and `data/` all sit at the kit root.
 
 ```powershell
-BUILD.bat                                   # builds trainer_win_x64.exe + trainer_linux_x64
+BUILD.bat                                   # builds trainer + count, for Windows and Linux
 .\trainer_win_x64.exe --list-variants
+.\count_win_x64.exe                         # how much data do I have, per variant
 ```
 
 | Variant | Engine | Board | Feats | W2 buckets | Anchor |
@@ -71,6 +72,71 @@ No flags needed — see **[DATA.md](DATA.md)**:
 
 Same convention as `stand-alone-selfplay`'s `--out-dir`, so its output copies
 straight across. A packed `.ntc` beats loose text when both are present.
+
+## How much data do I have? — `count`
+
+```powershell
+COUNT.bat                                     # every variant that has data, per file
+.\count_win_x64.exe                           # one row per variant
+.\count_win_x64.exe --variant=filipino --files
+.\count_win_x64.exe --variant=filipino --data "..\stand-alone-selfplay\bin\data\filipino\*.txt"
+.\count_win_x64.exe --json                    # one JSON object, nothing else
+```
+
+```
+VARIANT        SOURCE        FILES        GAMES          LINES         UNIQUE  DEDUP   MALFORMED     TB-SKIP
+filipino       text              7            9            622            283   2.2x           0         274
+chess          packed(.ntc)      1            -      2,245,788      1,907,570   1.2x           -           0
+```
+
+Second binary, same source tree and same source hash, so its numbers are the
+loader's numbers: `Count` and `Load` go through the same accept/reject
+predicates in `internal/corpus`, and `TestCountMatchesLoad` asserts they agree on
+LINES, UNIQUE and TB-SKIP for both kernels. It supersedes the engine kits'
+`c_port\tools\trainer\count.ps1`.
+
+Four columns that are easy to conflate:
+
+| | |
+|---|---|
+| `LINES` | accepted lines. **TB-skips are included** — this is what the loader reports |
+| `MALFORMED` | rejected *before* the loader counts them, so **not** in LINES. A wall of these means `--variant` names the wrong geometry |
+| `TB-SKIP` | **in** LINES, excluded from UNIQUE (that variant's tablebase rule) |
+| `GAMES` | distinct gameids **within each file**, summed. `gameid` restarts at 0 in every worker file, so it is only unique within one file |
+
+`GAMES` comes from the data, not from grepping `done:` in the paired `.log`, so it
+survives a lost log. The two can legitimately differ in both directions: a game
+with zero quiet positions writes no `.txt` lines (count < log), and a killed run
+writes lines for a game that never logged `done:` (count > log).
+
+A **packed `.ntc`** is read header-only — ~25 ms for a 100 MB corpus — which is
+why `GAMES` and `MALFORMED` print `-`: the format has never carried a game count,
+and the packer dropped bad lines before writing. Point `--data` at the `.txt`
+files to get games.
+
+`UNIQUE` dedups on a 64-bit hash of the position key (~12 B/entry against ~64 B
+for the full key; expected miscount is below 1e-4 even at 50M positions).
+`--exact-unique` uses the full key at roughly 5x the memory; `--unique=false`
+skips the set entirely and is about twice as fast.
+
+Nothing is written to stderr on success and there is no progress output, so the
+table is safe to capture from a script under `$ErrorActionPreference = "Stop"`.
+Exit codes:
+
+| code | meaning |
+|---|---|
+| 0 | success — including "some variants have no data", which is listed in a footer |
+| 1 | a file could not be read; the table is printed first, then the failures |
+| 2 | usage error (unknown `--variant`, `--data`/`--corpus` without exactly one `--variant`, an unquoted glob) |
+| 5 | the default sweep found no data anywhere |
+
+`3` and `4` are deliberately unused: they already mean "no GPU" and "accumulator
+overflow" in `trainer`, and two binaries in one kit must not give one code two
+meanings.
+
+One surprise worth knowing: the search path starts at the **binary's own**
+directory (`internal/datadir`), so running `count` from somewhere else still finds
+this kit's `data\`. That is the same rule the trainer uses.
 
 ## GPU training — use `train_gpu.py`
 
@@ -290,15 +356,20 @@ on the same data — which is exactly what `--algo=online` is for.
 
 ```
 trainer_win_x64.exe / trainer_linux_x64 / trainer_colab   built binaries
-build_all.ps1  BUILD.bat  UPDATE.bat    Windows + Linux builds
+count_win_x64.exe / count_linux_x64     data inventory (see below)
+build_all.ps1  BUILD.bat  UPDATE.bat    Windows + Linux builds, BOTH binaries
 build_colab.sh                          the CUDA build (run on Colab)
 train_nnue.ipynb                        Colab notebook
 parity.ps1                              the acceptance gate
+COUNT.bat                               double-click data inventory
 data/<variant>/                         corpora (gitignored)
 
 cmd/trainer/          CLI
+cmd/count/            data inventory CLI
+internal/datadir/     where a corpus lives; shared by both CLIs
 internal/variant/     the seven descriptors + the Kernel discriminator
-internal/corpus/      load, dedup, holdout, .ntc pack (both line formats)
+internal/corpus/      load, dedup, holdout, .ntc pack (both line formats),
+                      count.go (the inventory pass)
 internal/model/       weights, quantization, integer references, accbound
 internal/emit/        nnue_weights.h writers, .ntw, net.bin, legacy readers
 internal/train/       online.go (draughts oracle), batch.go (production)

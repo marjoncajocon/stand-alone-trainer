@@ -7,6 +7,7 @@ stand-alone-trainer\
     trainer_win_x64.exe
     trainer_linux_x64
     trainer_colab            <- built on Colab, the only one with --gpu
+    count_win_x64.exe        <- data inventory; count_linux_x64 too
     build_colab.sh
     parity.ps1
     data\<variant>\*.txt     <- PUT THE DATA HERE
@@ -32,6 +33,48 @@ Search order, first hit wins:
 
 If nothing is found the error prints every path it tried. `--data` and
 `--corpus` still override; `--data` is repeatable.
+
+`count_win_x64.exe` / `count_linux_x64` use the **same** search order — that is
+the point of sharing `internal/datadir` — so what the inventory reports is what
+training will read.
+
+## Counting a corpus
+
+```powershell
+.\count_win_x64.exe --variant=filipino --files
+```
+
+This supersedes the engine kits' `c_port\tools\trainer\count.ps1`, which walked a
+single flat `data\*.txt` folder and counted games by grepping `done:` in the
+paired `.log`. Two things changed:
+
+**Games come from the data.** A count is the number of distinct `gameid` values
+**within each file**, summed across files. `gameid` restarts at 0 in every worker
+file — `stand-alone-selfplay` runs one process per worker and each writes its own
+`.txt` — so the scope has to be one file, and the totals then add up with no
+cross-file dedup. The `.log` `done:` grep still works as an independent check
+(verified: both say 9 on the shipped filipino sample), but it is no longer the
+source of truth, so a corpus without logs is still countable.
+
+Where they can legitimately disagree: a game that produced zero quiet positions
+writes no `.txt` lines at all (count < log), and a killed run writes lines for a
+game that never logged `done:` (count > log).
+
+**Malformed and TB-skipped are not the same thing.** They sit on opposite sides
+of the loader's line counter:
+
+- `MALFORMED` is rejected *before* the loader counts it, so it is **not** in
+  `LINES`. Draughts: fewer than 3 fields, or a board whose length is not the
+  variant's cell count. Chess: fewer than 8 fields, an unparseable FEN, or a
+  result token that is not `1-0`/`0-1`/`1/2-1/2`. A wall of these almost always
+  means the wrong `--variant` for the geometry on disk (64 vs 100 cells).
+- `TB-SKIP` **is** in `LINES` and is only excluded from `UNIQUE`: the position is
+  well-formed, it is just in that variant's tablebase territory, which its
+  reference trainer drops. `--list-variants` prints the per-variant rule.
+
+A **packed `.ntc`** is read header-only, so `GAMES` and `MALFORMED` print `-`:
+the format has never carried a game count, and the packer dropped bad lines
+before writing. `--data` at the `.txt` files answers both.
 
 ## Chess on Colab — the whole loop
 
@@ -150,4 +193,10 @@ never had one.
 
 The selfplay kit writes a `.log` beside every `.txt`. The `*.txt` glob skips
 them, so they cost nothing — and their header carries `engine_hash=` and
-`depth=`, the only provenance a corpus has.
+`depth=`, the only provenance a corpus has. They also remain a useful independent
+check on `count`'s `GAMES` column:
+
+```powershell
+$g = 0; Get-ChildItem "data\filipino\*.log" |
+    ForEach-Object { $g += (Select-String -Path $_.FullName -Pattern "done:").Count }; $g
+```
